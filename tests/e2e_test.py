@@ -53,6 +53,10 @@ def wait_for(pred, timeout=10.0, step=0.1):
 
 class MediaHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # /crawl.mp4 answers the first request for this offset at 4 KB/s, like
+    # a TCP connection whose receive window has collapsed.
+    CRAWL_AT = 2 * 256 * 1024
+    crawled = False
 
     def log_message(self, *args):
         pass
@@ -69,7 +73,7 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        ranges = self.path.startswith("/video.mp4")
+        ranges = self.path.startswith(("/video.mp4", "/crawl.mp4"))
         if not ranges and not self.path.startswith("/norange.mp4"):
             self.send_response(404)
             self.send_header("Content-Length", "0")
@@ -90,8 +94,16 @@ class MediaHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "video/mp4")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        crawl = (self.path.startswith("/crawl.mp4") and rng and start == self.CRAWL_AT
+                 and not MediaHandler.crawled)
         try:
-            self.wfile.write(body)
+            if crawl:
+                MediaHandler.crawled = True
+                for i in range(0, len(body), 2048):
+                    self.wfile.write(body[i : i + 2048])
+                    time.sleep(0.5)
+            else:
+                self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -172,9 +184,13 @@ def run_fetch(binary, data_dir, url, out):
 
 def test_fetch(binary, data_dir, base):
     print("HTTP range cache (--fetch)")
-    for path in ("/video.mp4", "/redirect", "/norange.mp4"):
+    for path in ("/video.mp4", "/redirect", "/norange.mp4", "/crawl.mp4"):
         out = os.path.join(data_dir, "fetched.bin")
+        started = time.time()
         ok, log = run_fetch(binary, data_dir, base + path, out)
+        if path == "/crawl.mp4":
+            check(MediaHandler.crawled and time.time() - started < 40,
+                  "fetch gives up on a crawling connection and retries")
         same = ok and open(out, "rb").read() == MEDIA
         check(same, f"fetch {path} returns identical bytes")
         if not same:

@@ -20,6 +20,11 @@
 /* Read-ahead is optional: give up fast so on-demand reads never sit
  * behind a stalled prefetch for long. */
 #define PREFETCH_TIMEOUT_MS 5000
+/* Total time one block may take, however steadily data trickles in. A
+ * connection can get stuck crawling (seen on Linux: the receive window
+ * collapses to 2 KB and never reopens); a fresh one is fast again. */
+#define PREFETCH_BLOCK_MS 10000
+#define READ_BLOCK_MS 20000
 #define HTTP_POLL_MS 250
 #define MAX_REDIRECTS 6
 
@@ -99,6 +104,8 @@ typedef struct http_conn {
     atomic_int phase; /* conn_phase, for http_source_debug() */
     atomic_llong rx;  /* bytes received, for http_source_debug() */
     int timeout_ms;   /* idle limit for connect and reads; 0 = HTTP_TIMEOUT_MS */
+    int block_ms;     /* limit for a whole block fetch; 0 = none */
+    uint64_t deadline; /* plat_ticks_ms() limit for the current fetch; 0 = none */
 } http_conn;
 
 enum conn_phase { PH_IDLE, PH_CONNECT, PH_SEND, PH_HEAD, PH_BODY, PH_SKIP };
@@ -144,16 +151,17 @@ static int conn_open(http_conn *c, const http_url *u)
     return 0;
 }
 
-static int conn_fill(http_conn *c)
+/* Receives up to cap bytes into dst, waiting out the idle timeout.
+ * Returns bytes, 0 at EOF or -1. */
+static int conn_recv(http_conn *c, uint8_t *dst, size_t cap)
 {
     int waited = 0;
-    if (c->pos < c->len)
-        return 1;
-    c->pos = c->len = 0;
     for (;;) {
         if (c->abort_flag && *c->abort_flag)
             return -1;
-        int n = tstream_read(&c->ts, c->buf, sizeof(c->buf), HTTP_POLL_MS);
+        if (c->deadline && plat_ticks_ms() > c->deadline)
+            return -1;
+        int n = tstream_read(&c->ts, dst, cap, HTTP_POLL_MS);
         if (n == NET_TIMEOUT) {
             waited += HTTP_POLL_MS;
             if (waited >= (c->timeout_ms ? c->timeout_ms : HTTP_TIMEOUT_MS))
@@ -162,14 +170,29 @@ static int conn_fill(http_conn *c)
         }
         if (n <= 0)
             return n == 0 ? 0 : -1;
-        c->len = (size_t)n;
         c->rx += n;
-        return 1;
+        return n;
     }
+}
+
+static int conn_fill(http_conn *c)
+{
+    if (c->pos < c->len)
+        return 1;
+    c->pos = c->len = 0;
+    int n = conn_recv(c, c->buf, sizeof(c->buf));
+    if (n <= 0)
+        return n;
+    c->len = (size_t)n;
+    return 1;
 }
 
 static int conn_read(http_conn *c, uint8_t *dst, size_t n)
 {
+    /* Large reads go straight to dst: draining the socket quickly keeps
+     * the receive window open. */
+    if (c->pos == c->len && n >= sizeof(c->buf))
+        return conn_recv(c, dst, n > INT32_MAX ? INT32_MAX : n);
     int rc = conn_fill(c);
     if (rc <= 0)
         return rc;
@@ -454,6 +477,7 @@ static int64_t fetch_block(http_source *hs, http_conn *c, int64_t blk, uint8_t *
         http_resp r;
         body_reader b;
         int ok;
+        c->deadline = c->block_ms ? plat_ticks_ms() + (uint64_t)c->block_ms : 0;
         c->phase = PH_CONNECT;
         ok = conn_open(c, &hs->url) == 0;
         c->phase = PH_SEND;
@@ -462,6 +486,7 @@ static int64_t fetch_block(http_source *hs, http_conn *c, int64_t blk, uint8_t *
         ok = ok && read_response_head(c, &r) == 0;
         if (!ok) {
             c->phase = PH_IDLE;
+            c->deadline = 0;
             if (!hs->aborted)
                 LOGI("HTTP: no response for bytes %lld- (attempt %d)", (long long)start, attempt + 1);
             conn_close(c);
@@ -494,6 +519,7 @@ static int64_t fetch_block(http_source *hs, http_conn *c, int64_t blk, uint8_t *
         if (!reusable || !b.done)
             conn_close(c);
         c->phase = PH_IDLE;
+        c->deadline = 0;
         if (got == want)
             return got;
         if (!hs->aborted)
@@ -611,6 +637,8 @@ http_source *http_source_open(const char *url, char *err, size_t errcap)
     hs->reader.abort_flag = &hs->aborted;
     hs->prefetcher.abort_flag = &hs->aborted;
     hs->prefetcher.timeout_ms = PREFETCH_TIMEOUT_MS;
+    hs->prefetcher.block_ms = PREFETCH_BLOCK_MS;
+    hs->reader.block_ms = READ_BLOCK_MS;
     for (int i = 0; i < HS_SLOTS; i++) {
         hs->slots[i].data = malloc(HS_BLOCK);
         if (!hs->slots[i].data) {
@@ -794,12 +822,14 @@ void http_source_close(http_source *hs)
     hs_free(hs);
 }
 
+/* Explicit atomic_load: GCC's TSan build treated an _Atomic used as an
+ * array index as a plain read. */
 void http_source_progress(http_source *hs, char *out, size_t cap)
 {
     snprintf(out, cap, "reader: phase=%s rx=%lld waiting=%d prefetcher: phase=%s rx=%lld block=%lld",
-             g_phase_names[hs->reader.phase], (long long)hs->reader.rx, (int)hs->reader_waiting,
-             g_phase_names[hs->prefetcher.phase], (long long)hs->prefetcher.rx,
-             (long long)hs->prefetch_block);
+             g_phase_names[atomic_load(&hs->reader.phase)], (long long)atomic_load(&hs->reader.rx),
+             (int)atomic_load(&hs->reader_waiting), g_phase_names[atomic_load(&hs->prefetcher.phase)],
+             (long long)atomic_load(&hs->prefetcher.rx), (long long)atomic_load(&hs->prefetch_block));
 }
 
 void http_source_debug(http_source *hs, char *out, size_t cap)
@@ -818,9 +848,10 @@ void http_source_debug(http_source *hs, char *out, size_t cap)
     snprintf(out, cap,
              "size=%lld ranges=%d aborted=%d window=[%lld,%lld] reader: phase=%s rx=%lld waiting=%d "
              "prefetcher: phase=%s rx=%lld waiting=%d block=%lld started=%d slots: %s",
-             (long long)hs->size, hs->ranges_ok, (int)hs->aborted, (long long)hs->pf_from,
-             (long long)hs->pf_to, g_phase_names[hs->reader.phase], (long long)hs->reader.rx,
-             (int)hs->reader_waiting, g_phase_names[hs->prefetcher.phase],
-             (long long)hs->prefetcher.rx, (int)hs->prefetch_waiting,
-             (long long)hs->prefetch_block, hs->prefetch_started, slots);
+             (long long)hs->size, hs->ranges_ok, (int)atomic_load(&hs->aborted),
+             (long long)hs->pf_from, (long long)hs->pf_to,
+             g_phase_names[atomic_load(&hs->reader.phase)], (long long)atomic_load(&hs->reader.rx),
+             (int)atomic_load(&hs->reader_waiting), g_phase_names[atomic_load(&hs->prefetcher.phase)],
+             (long long)atomic_load(&hs->prefetcher.rx), (int)atomic_load(&hs->prefetch_waiting),
+             (long long)atomic_load(&hs->prefetch_block), hs->prefetch_started, slots);
 }
