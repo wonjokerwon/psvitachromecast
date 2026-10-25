@@ -17,6 +17,9 @@
 #define HS_SLOTS 32
 #define HS_PREFETCH 4
 #define HTTP_TIMEOUT_MS 15000
+/* Read-ahead is optional: give up fast so on-demand reads never sit
+ * behind a stalled prefetch for long. */
+#define PREFETCH_TIMEOUT_MS 5000
 #define HTTP_POLL_MS 250
 #define MAX_REDIRECTS 6
 
@@ -94,6 +97,7 @@ typedef struct http_conn {
     size_t pos, len;
     atomic_int *abort_flag;
     atomic_int phase; /* conn_phase, for http_source_debug() */
+    int timeout_ms;   /* idle limit for connect and reads; 0 = HTTP_TIMEOUT_MS */
 } http_conn;
 
 enum conn_phase { PH_IDLE, PH_CONNECT, PH_SEND, PH_HEAD, PH_BODY, PH_SKIP };
@@ -130,7 +134,7 @@ static int conn_open(http_conn *c, const http_url *u)
     if (c->open && c->tls == u->tls && c->port == u->port && strcmp(c->host, u->host) == 0)
         return 0;
     conn_close(c);
-    if (tstream_connect(&c->ts, u->host, u->port, u->tls, HTTP_TIMEOUT_MS) != 0)
+    if (tstream_connect(&c->ts, u->host, u->port, u->tls, c->timeout_ms ? c->timeout_ms : HTTP_TIMEOUT_MS) != 0)
         return -1;
     c->open = 1;
     c->tls = u->tls;
@@ -151,7 +155,7 @@ static int conn_fill(http_conn *c)
         int n = tstream_read(&c->ts, c->buf, sizeof(c->buf), HTTP_POLL_MS);
         if (n == NET_TIMEOUT) {
             waited += HTTP_POLL_MS;
-            if (waited >= HTTP_TIMEOUT_MS)
+            if (waited >= (c->timeout_ms ? c->timeout_ms : HTTP_TIMEOUT_MS))
                 return -1;
             continue;
         }
@@ -436,7 +440,7 @@ struct http_source {
 };
 
 /* Fetches block `blk` into dst using connection c. Returns bytes or -1. */
-static int64_t fetch_block(http_source *hs, http_conn *c, int64_t blk, uint8_t *dst)
+static int64_t fetch_block(http_source *hs, http_conn *c, int64_t blk, uint8_t *dst, int attempts)
 {
     int64_t start = blk * HS_BLOCK;
     int64_t end = start + HS_BLOCK - 1;
@@ -444,7 +448,7 @@ static int64_t fetch_block(http_source *hs, http_conn *c, int64_t blk, uint8_t *
         end = hs->size - 1;
     int64_t want = end - start + 1;
 
-    for (int attempt = 0; attempt < 3 && !hs->aborted; attempt++) {
+    for (int attempt = 0; attempt < attempts && !hs->aborted; attempt++) {
         http_resp r;
         body_reader b;
         int ok;
@@ -562,7 +566,7 @@ static void *prefetch_main(void *arg)
         s->state = SLOT_LOADING;
         hs->prefetch_block = blk;
         pthread_mutex_unlock(&hs->lock);
-        int64_t n = fetch_block(hs, &hs->prefetcher, blk, s->data);
+        int64_t n = fetch_block(hs, &hs->prefetcher, blk, s->data, 1);
         pthread_mutex_lock(&hs->lock);
         if (n < 0) {
             s->state = SLOT_EMPTY;
@@ -604,6 +608,7 @@ http_source *http_source_open(const char *url, char *err, size_t errcap)
     pthread_cond_init(&hs->cond, NULL);
     hs->reader.abort_flag = &hs->aborted;
     hs->prefetcher.abort_flag = &hs->aborted;
+    hs->prefetcher.timeout_ms = PREFETCH_TIMEOUT_MS;
     for (int i = 0; i < HS_SLOTS; i++) {
         hs->slots[i].data = malloc(HS_BLOCK);
         if (!hs->slots[i].data) {
@@ -730,7 +735,7 @@ int http_source_read(http_source *hs, uint8_t *buf, uint64_t pos, uint32_t len)
             s->state = SLOT_LOADING;
             pthread_mutex_unlock(&hs->lock);
             pthread_mutex_lock(&hs->reader_lock);
-            int64_t n = fetch_block(hs, &hs->reader, blk, s->data);
+            int64_t n = fetch_block(hs, &hs->reader, blk, s->data, 3);
             pthread_mutex_unlock(&hs->reader_lock);
             pthread_mutex_lock(&hs->lock);
             if (n < 0) {
