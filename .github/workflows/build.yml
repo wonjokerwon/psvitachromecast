@@ -1,0 +1,58 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  vita:
+    name: PS Vita VPK
+    runs-on: ubuntu-24.04
+    container: vitasdk/vitasdk:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build-vita \
+            -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-vita -j"$(nproc)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vitacast-vpk
+          path: build-vita/vitacast.vpk
+
+  host:
+    name: Protocol tests (${{ matrix.sanitizer }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: asan+ubsan
+            flags: -DVITACAST_SANITIZE=ON
+          - sanitizer: tsan
+            flags: -DVITACAST_TSAN=ON
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmbedtls-dev
+          pip install pychromecast catt cryptography
+      - name: Allow TSan's memory layout
+        if: matrix.sanitizer == 'tsan'
+        # Ubuntu 24.04's default ASLR entropy breaks ThreadSanitizer.
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Build
+        run: |
+          cmake -S . -B build -DVITACAST_HOST=ON ${{ matrix.flags }} -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build -j"$(nproc)"
+      - name: Unit and end-to-end tests
+        # A sanitizer report makes the receiver exit non-zero, which the
+        # end-to-end test checks for.
+        run: ctest --test-dir build --output-on-failure

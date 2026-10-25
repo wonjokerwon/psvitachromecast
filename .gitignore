@@ -1,0 +1,5 @@
+build/
+build-*/
+vitacast-data/
+__pycache__/
+*.vpk
