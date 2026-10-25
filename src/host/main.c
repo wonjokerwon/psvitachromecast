@@ -89,6 +89,7 @@ static int do_fetch(const char *url, const char *out_path)
         return 1;
     }
     int64_t size = http_source_size(hs);
+    fprintf(stderr, "fetch: opened, %lld bytes\n", (long long)size);
     pthread_t wd;
     g_fetch_hs = hs;
     pthread_create(&wd, NULL, fetch_watchdog, NULL);
@@ -120,10 +121,12 @@ static int do_fetch(const char *url, const char *out_path)
         step = step * 3 % 299989 + 17;
     }
     fclose(f);
+    fprintf(stderr, "fetch: read done (rc=%d), closing\n", rc);
     g_fetch_pos = -2; /* closing counts as progress */
     http_source_close(hs);
     g_fetch_done = 1;
     pthread_join(wd, NULL);
+    fprintf(stderr, "fetch: closed, exiting\n");
     if (rc == 0)
         printf("fetched %lld bytes\n", (long long)size);
     return rc;

@@ -116,7 +116,10 @@ def run_fetch(binary, data_dir, url, out):
         return r.returncode == 0, r.stdout + r.stderr
     except subprocess.TimeoutExpired as e:
         log = (e.stdout or b"") + (e.stderr or b"")
-        return False, "TIMEOUT after 120s\n" + (log.decode(errors="replace") if isinstance(log, bytes) else log)
+        if isinstance(log, bytes):
+            log = log.decode(errors="replace")
+        complete = os.path.exists(out) and open(out, "rb").read() == MEDIA
+        return False, f"TIMEOUT after 120s (output file complete: {complete})\n" + log
 
 
 def test_fetch(binary, data_dir, base):
