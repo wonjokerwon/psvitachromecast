@@ -8,6 +8,7 @@
 #include "../src/core/json.h"
 #include "../src/core/mdns.h"
 #include "../src/core/sb.h"
+#include "../mirror/plugin/mirror_logic.h"
 
 static int g_failures;
 static int g_checks;
@@ -243,12 +244,128 @@ static void test_url(void)
     CHECK(http_parse_url("http://h:99999/x", &u) != 0);
 }
 
+static void fill_layout(uint8_t *buf, int w, int h, yuv_layout l, int y, int cb, int cr)
+{
+    size_t c = (size_t)w * h, q = c / 4;
+    memset(buf, y, c);
+    for (size_t i = 0; i < q; i++) {
+        switch (l) {
+        case LAYOUT_NV12: buf[c + 2 * i] = (uint8_t)cb; buf[c + 2 * i + 1] = (uint8_t)cr; break;
+        case LAYOUT_NV21: buf[c + 2 * i] = (uint8_t)cr; buf[c + 2 * i + 1] = (uint8_t)cb; break;
+        case LAYOUT_I420: buf[c + i] = (uint8_t)cb; buf[c + q + i] = (uint8_t)cr; break;
+        case LAYOUT_YV12: buf[c + i] = (uint8_t)cr; buf[c + q + i] = (uint8_t)cb; break;
+        default: break;
+        }
+    }
+}
+
+static void test_mirror_logic(void)
+{
+    int y, cb, cr;
+    rgb_to_ycbcr(255, 255, 255, &y, &cb, &cr);
+    CHECK(y == 255 && cb == 128 && cr == 128);
+    rgb_to_ycbcr(0, 0, 0, &y, &cb, &cr);
+    CHECK(y == 0 && cb == 128 && cr == 128);
+    rgb_to_ycbcr(30, 60, 220, &y, &cb, &cr); /* the plugin's self-test colour */
+    CHECK(y > 60 && y < 75 && cb > 205 && cb < 220 && cr > 92 && cr < 108);
+
+    enum { W = 64, H = 32 };
+    static uint8_t buf[W * H * 3 / 2];
+    yuv_layout all[] = { LAYOUT_NV12, LAYOUT_NV21, LAYOUT_I420, LAYOUT_YV12 };
+    for (int i = 0; i < 4; i++) {
+        fill_layout(buf, W, H, all[i], y, cb, cr);
+        CHECK(detect_layout(buf, W, H, cb, cr) == all[i]);
+        /* small encoder rounding differences are tolerated */
+        fill_layout(buf, W, H, all[i], y, cb - 5, cr + 4);
+        CHECK(detect_layout(buf, W, H, cb, cr) == all[i]);
+    }
+    memset(buf, 0, sizeof(buf));
+    CHECK(detect_layout(buf, W, H, cb, cr) == LAYOUT_UNKNOWN);
+    CHECK(detect_layout(buf, W, H, 128, 130) == LAYOUT_UNKNOWN); /* ambiguous colour */
+
+    char q[64];
+    const char *r1 = "GET /stream.mjpg?t=123 HTTP/1.1\r\nHost: x\r\n\r\n";
+    CHECK(request_complete(r1, strlen(r1)));
+    CHECK(!request_complete(r1, strlen(r1) - 2));
+    CHECK(parse_request(r1, strlen(r1), q, sizeof(q)) == REQ_STREAM && strcmp(q, "t=123") == 0);
+    CHECK(parse_request("GET / HTTP/1.1\r\n\r\n", 18, q, sizeof(q)) == REQ_INDEX && q[0] == 0);
+    CHECK(parse_request("GET /status HTTP/1.1\r\n", 22, q, sizeof(q)) == REQ_STATUS);
+    CHECK(parse_request("GET /frame.jpg HTTP/1.1\r\n", 25, q, sizeof(q)) == REQ_FRAME);
+    CHECK(parse_request("GET /control?preset=2&ratio=90 HTTP/1.1", 39, q, sizeof(q)) == REQ_CONTROL);
+    int v = -1;
+    CHECK(query_int(q, "preset", &v) && v == 2);
+    CHECK(query_int(q, "ratio", &v) && v == 90);
+    CHECK(!query_int(q, "fps", &v));
+    CHECK(!query_int("xpreset=1", "preset", &v));
+    CHECK(query_int("paused=0", "paused", &v) && v == 0);
+    CHECK(parse_request("GET /nope HTTP/1.1", 18, q, sizeof(q)) == REQ_NOT_FOUND);
+    CHECK(parse_request("POST / HTTP/1.1", 15, q, sizeof(q)) == REQ_BAD);
+    CHECK(parse_request("GET", 3, q, sizeof(q)) == REQ_BAD);
+    for (int i = 0; i < MIRROR_PRESETS; i++)
+        CHECK(mirror_presets[i].width % 16 == 0 && mirror_presets[i].height % 16 == 0);
+    CHECK(strstr(mirror_viewer_html, "/stream.mjpg") != NULL);
+}
+
+static void test_mdns_browse_parse(void)
+{
+    mdns_info info;
+    memset(&info, 0, sizeof(info));
+    snprintf(info.instance, sizeof(info.instance), "Chromecast-abc");
+    snprintf(info.hostname, sizeof(info.hostname), "abc-host");
+    snprintf(info.ip, sizeof(info.ip), "10.1.2.3");
+    info.port = 8009;
+    snprintf(info.txt[info.txt_count++], 128, "fn=Living Room TV");
+    snprintf(info.txt[info.txt_count++], 128, "md=Chromecast");
+    snprintf(info.txt[info.txt_count++], 128, "ca=4101");
+
+    uint8_t pkt[1500];
+    size_t n = mdns_build_response(pkt, sizeof(pkt), &info, 0, 1, 0);
+    mdns_collector c;
+    memset(&c, 0, sizeof(c));
+    mdns_collect(&c, pkt, n, "10.9.9.9");
+    cast_device d[4];
+    CHECK(mdns_collector_devices(&c, d, 4) == 1);
+    CHECK(strcmp(d[0].name, "Living Room TV") == 0);
+    CHECK(strcmp(d[0].ip, "10.1.2.3") == 0); /* A record wins over the sender address */
+    CHECK(d[0].port == 8009 && strcmp(d[0].model, "Chromecast") == 0);
+
+    /* Duplicate answers do not duplicate devices. */
+    mdns_collect(&c, pkt, n, "10.9.9.9");
+    CHECK(mdns_collector_devices(&c, d, 4) == 1);
+
+    /* A speaker (no video out bit) is ignored. */
+    mdns_info spk = info;
+    snprintf(spk.instance, sizeof(spk.instance), "Speaker-1");
+    snprintf(spk.txt[2], 128, "ca=2052");
+    n = mdns_build_response(pkt, sizeof(pkt), &spk, 0, 1, 0);
+    mdns_collect(&c, pkt, n, "10.9.9.8");
+    CHECK(mdns_collector_devices(&c, d, 4) == 1);
+
+    /* Queries are not mistaken for answers; garbage does not crash. */
+    uint8_t q[512];
+    size_t ql = mdns_build_query(q, sizeof(q));
+    CHECK(ql > 12);
+    mdns_collect(&c, q, ql, "10.0.0.1");
+    srand(7);
+    for (int i = 0; i < 2000; i++) {
+        size_t len = (size_t)(rand() % 300);
+        for (size_t k = 0; k < len; k++)
+            pkt[k] = (uint8_t)rand();
+        if (len > 2)
+            pkt[2] |= 0x80;
+        mdns_collect(&c, pkt, len, "10.0.0.2");
+    }
+    CHECK(c.ninst <= MDNS_MAX_SEEN && c.nhost <= MDNS_MAX_SEEN);
+}
+
 int main(void)
 {
     test_json();
     test_castmsg();
     test_mdns();
     test_url();
+    test_mirror_logic();
+    test_mdns_browse_parse();
     printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

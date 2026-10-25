@@ -76,7 +76,7 @@ int main(void)
     char last_title[128] = "";
     pthread_t keys_thread;
 
-    vita_platform_init();
+    vita_platform_init("log.txt");
     LOGI("VitaCast starting");
     if (ui_init() != 0) {
         sceKernelExitProcess(0);

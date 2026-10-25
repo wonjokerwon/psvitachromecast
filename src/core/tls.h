@@ -12,6 +12,8 @@
  * self-signed RSA-2048 pair on first run (takes a while on the Vita).
  * common_name is used for a newly generated certificate. */
 int tls_init(const char *data_dir, const char *common_name);
+/* Client-only setup (no device identity, so no slow key generation). */
+int tls_init_client(void);
 void tls_shutdown(void);
 
 /* DER encoding of the certificate presented on the Cast TLS channel. */

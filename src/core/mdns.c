@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../platform/platform.h"
@@ -342,4 +343,205 @@ void mdns_stop(void)
     send_full(0, MDNS_GROUP, MDNS_PORT, 0, 0); /* goodbye */
     net_close(g_fd);
     g_fd = -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* browsing                                                            */
+
+size_t mdns_build_query(uint8_t *buf, size_t cap)
+{
+    pkt_writer w = { buf, cap, 0, 0 };
+    w_u16(&w, 0);      /* id */
+    w_u16(&w, 0);      /* standard query */
+    w_u16(&w, 1);      /* one question */
+    w_u16(&w, 0);
+    w_u16(&w, 0);
+    w_u16(&w, 0);
+    w_name2(&w, NULL, SERVICE);
+    w_u16(&w, TYPE_PTR);
+    w_u16(&w, CLASS_IN);
+    return w.overflow ? 0 : w.len;
+}
+
+static int ends_with(const char *s, const char *suffix)
+{
+    size_t a = strlen(s), b = strlen(suffix);
+    return a >= b && strcmp(s + a - b, suffix) == 0;
+}
+
+static mdns_seen_instance *seen_instance(mdns_collector *c, const char *name, const char *from_ip)
+{
+    for (int i = 0; i < c->ninst; i++)
+        if (strcmp(c->inst[i].instance, name) == 0)
+            return &c->inst[i];
+    if (c->ninst >= MDNS_MAX_SEEN)
+        return NULL;
+    mdns_seen_instance *s = &c->inst[c->ninst++];
+    memset(s, 0, sizeof(*s));
+    snprintf(s->instance, sizeof(s->instance), "%s", name);
+    snprintf(s->from_ip, sizeof(s->from_ip), "%s", from_ip ? from_ip : "");
+    s->capabilities = -1;
+    return s;
+}
+
+static void seen_host(mdns_collector *c, const char *host, const char *ip)
+{
+    for (int i = 0; i < c->nhost; i++) {
+        if (strcmp(c->host[i].host, host) == 0) {
+            snprintf(c->host[i].ip, sizeof(c->host[i].ip), "%s", ip);
+            return;
+        }
+    }
+    if (c->nhost >= MDNS_MAX_SEEN)
+        return;
+    snprintf(c->host[c->nhost].host, sizeof(c->host[0].host), "%s", host);
+    snprintf(c->host[c->nhost].ip, sizeof(c->host[0].ip), "%s", ip);
+    c->nhost++;
+}
+
+/* Copies TXT value text (case preserved) for key into out. */
+static void txt_value(const uint8_t *p, size_t len, const char *key, char *out, size_t cap)
+{
+    size_t klen = strlen(key);
+    size_t i = 0;
+    while (i < len) {
+        size_t n = p[i++];
+        if (i + n > len)
+            return;
+        if (n > klen && memcmp(p + i, key, klen) == 0 && p[i + klen] == '=') {
+            size_t vlen = n - klen - 1;
+            if (vlen >= cap)
+                vlen = cap - 1;
+            memcpy(out, p + i + klen + 1, vlen);
+            out[vlen] = '\0';
+            return;
+        }
+        i += n;
+    }
+}
+
+void mdns_collect(mdns_collector *c, const uint8_t *pkt, size_t len, const char *from_ip)
+{
+    char owner[256], name[256];
+    if (len < 12)
+        return;
+    uint16_t flags = (uint16_t)((pkt[2] << 8) | pkt[3]);
+    if (!(flags & 0x8000))
+        return; /* only responses */
+    unsigned qd = (unsigned)((pkt[4] << 8) | pkt[5]);
+    unsigned rr = (unsigned)((pkt[6] << 8) | pkt[7]) + (unsigned)((pkt[8] << 8) | pkt[9]) +
+                  (unsigned)((pkt[10] << 8) | pkt[11]);
+    size_t off = 12;
+    for (unsigned i = 0; i < qd; i++) {
+        if (read_name(pkt, len, &off, name, sizeof(name)) < 0 || off + 4 > len)
+            return;
+        off += 4;
+    }
+    for (unsigned i = 0; i < rr; i++) {
+        if (read_name(pkt, len, &off, owner, sizeof(owner)) < 0 || off + 10 > len)
+            return;
+        uint16_t type = (uint16_t)((pkt[off] << 8) | pkt[off + 1]);
+        uint16_t rdlen = (uint16_t)((pkt[off + 8] << 8) | pkt[off + 9]);
+        off += 10;
+        if (off + rdlen > len)
+            return;
+        size_t rd = off;
+        off += rdlen;
+
+        if (type == TYPE_PTR && strcmp(owner, SERVICE) == 0) {
+            size_t p = rd;
+            if (read_name(pkt, len, &p, name, sizeof(name)) == 0 && ends_with(name, "." SERVICE))
+                seen_instance(c, name, from_ip);
+        } else if (type == TYPE_SRV && ends_with(owner, "." SERVICE) && rdlen > 6) {
+            mdns_seen_instance *s = seen_instance(c, owner, from_ip);
+            size_t p = rd + 6;
+            if (s && read_name(pkt, len, &p, name, sizeof(name)) == 0) {
+                s->port = (uint16_t)((pkt[rd + 4] << 8) | pkt[rd + 5]);
+                snprintf(s->target, sizeof(s->target), "%s", name);
+            }
+        } else if (type == TYPE_TXT && ends_with(owner, "." SERVICE)) {
+            mdns_seen_instance *s = seen_instance(c, owner, from_ip);
+            if (s) {
+                char ca[16] = "";
+                txt_value(pkt + rd, rdlen, "fn", s->name, sizeof(s->name));
+                txt_value(pkt + rd, rdlen, "md", s->model, sizeof(s->model));
+                txt_value(pkt + rd, rdlen, "id", s->id, sizeof(s->id));
+                txt_value(pkt + rd, rdlen, "ca", ca, sizeof(ca));
+                if (ca[0])
+                    s->capabilities = atoi(ca);
+            }
+        } else if (type == TYPE_A && rdlen == 4) {
+            char ip[16];
+            snprintf(ip, sizeof(ip), "%u.%u.%u.%u", pkt[rd], pkt[rd + 1], pkt[rd + 2], pkt[rd + 3]);
+            seen_host(c, owner, ip);
+        }
+    }
+}
+
+int mdns_collector_devices(const mdns_collector *c, cast_device *out, int max)
+{
+    int n = 0;
+    for (int i = 0; i < c->ninst && n < max; i++) {
+        const mdns_seen_instance *s = &c->inst[i];
+        if (!s->port)
+            continue;
+        /* Bit 0 of "ca" is video out; skip speakers and audio groups. */
+        if (s->capabilities >= 0 && !(s->capabilities & 1))
+            continue;
+        cast_device *d = &out[n];
+        memset(d, 0, sizeof(*d));
+        const char *ip = s->from_ip;
+        for (int h = 0; h < c->nhost; h++)
+            if (strcmp(c->host[h].host, s->target) == 0)
+                ip = c->host[h].ip;
+        if (!ip[0])
+            continue;
+        snprintf(d->ip, sizeof(d->ip), "%s", ip);
+        d->port = s->port;
+        snprintf(d->model, sizeof(d->model), "%s", s->model);
+        snprintf(d->id, sizeof(d->id), "%s", s->id);
+        if (s->name[0]) {
+            snprintf(d->name, sizeof(d->name), "%s", s->name);
+        } else {
+            /* Fall back to the first label of the instance name. */
+            size_t l = strcspn(s->instance, ".");
+            snprintf(d->name, sizeof(d->name), "%.*s", (int)(l < 63 ? l : 63), s->instance);
+        }
+        n++;
+    }
+    return n;
+}
+
+int mdns_browse(const char *iface_ip, int timeout_ms, cast_device *out, int max)
+{
+    uint8_t q[512], pkt[1500];
+    char from[16];
+    mdns_collector *c = calloc(1, sizeof(*c));
+    if (!c)
+        return 0;
+    int fd = net_udp_multicast(MDNS_PORT, MDNS_GROUP, iface_ip);
+    if (fd < 0) {
+        free(c);
+        return -1;
+    }
+    size_t qlen = mdns_build_query(q, sizeof(q));
+    uint64_t start = plat_ticks_ms(), next_query = start;
+    int sent = 0;
+    for (;;) {
+        uint64_t now = plat_ticks_ms();
+        if (now - start >= (uint64_t)timeout_ms)
+            break;
+        if (now >= next_query && sent < 3) {
+            net_udp_sendto(fd, q, qlen, MDNS_GROUP, MDNS_PORT);
+            sent++;
+            next_query = now + 700;
+        }
+        int n = net_udp_recvfrom(fd, pkt, sizeof(pkt), 100, from, NULL);
+        if (n > 0)
+            mdns_collect(c, pkt, (size_t)n, from);
+    }
+    net_close(fd);
+    int count = mdns_collector_devices(c, out, max);
+    free(c);
+    return count;
 }

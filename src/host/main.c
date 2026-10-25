@@ -7,9 +7,11 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "../core/cast_sender.h"
 #include "../core/config.h"
 #include "../core/http.h"
 #include "../core/log.h"
+#include "../core/mdns.h"
 #include "../core/receiver.h"
 #include "../core/tls.h"
 #include "../platform/platform.h"
@@ -36,7 +38,10 @@ static void usage(const char *argv0)
             "  --https-port N     device info TLS port (default 8443, 0 = off)\n"
             "  --no-mdns          do not advertise via mDNS\n"
             "  --quiet            no log output\n"
-            "  --fetch URL FILE   download URL through the range cache and exit\n",
+            "  --fetch URL FILE   download URL through the range cache and exit\n"
+            "  --discover         list Cast devices with a screen and exit\n"
+            "  --cast-url HOST[:PORT] URL   show URL on a Cast device (via DashCast)\n"
+            "  --stop-cast HOST[:PORT]      stop the app running on a Cast device\n",
             argv0);
 }
 
@@ -87,10 +92,36 @@ static int do_fetch(const char *url, const char *out_path)
     return rc;
 }
 
+/* Splits "host[:port]" (default port 8009). */
+static void split_host(const char *arg, char *host, size_t cap, uint16_t *port)
+{
+    snprintf(host, cap, "%s", arg);
+    *port = 8009;
+    char *colon = strchr(host, ':');
+    if (colon) {
+        *colon = '\0';
+        *port = (uint16_t)atoi(colon + 1);
+    }
+}
+
+static int do_discover(void)
+{
+    cast_device devs[16];
+    char ip[16];
+    plat_local_ipv4(ip);
+    int n = mdns_browse(ip, 3000, devs, 16);
+    for (int i = 0; i < n; i++)
+        printf("%s\t%s:%u\t%s\t%s\n", devs[i].name, devs[i].ip, (unsigned)devs[i].port,
+               devs[i].model, devs[i].id);
+    return n < 0 ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *name = NULL;
     const char *fetch_url = NULL, *fetch_out = NULL;
+    const char *cast_target = NULL, *cast_url = NULL, *stop_target = NULL;
+    int discover = 0;
     int port = 8009, http_port = 8008, https_port = 8443, mdns = 1;
 
     for (int i = 1; i < argc; i++) {
@@ -118,6 +149,15 @@ int main(int argc, char **argv)
             mdns = 0;
         } else if (strcmp(a, "--quiet") == 0) {
             host_set_quiet(1);
+        } else if (strcmp(a, "--discover") == 0) {
+            discover = 1;
+        } else if (strcmp(a, "--cast-url") == 0 && v && i + 2 < argc) {
+            cast_target = v;
+            cast_url = argv[i + 2];
+            i += 2;
+        } else if (strcmp(a, "--stop-cast") == 0 && v) {
+            stop_target = v;
+            i++;
         } else if (strcmp(a, "--fetch") == 0 && v && i + 2 < argc) {
             fetch_url = v;
             fetch_out = argv[i + 2];
@@ -136,12 +176,26 @@ int main(int argc, char **argv)
     if (name)
         snprintf(cfg.name, sizeof(cfg.name), "%s", name);
 
-    if (tls_init(plat_data_dir(), cfg.uuid_hex) != 0) {
+    /* Commands that only act as a client skip the device key. */
+    int client_only = fetch_url || discover || cast_target || stop_target;
+    if ((client_only ? tls_init_client() : tls_init(plat_data_dir(), cfg.uuid_hex)) != 0) {
         fprintf(stderr, "TLS init failed\n");
         return 1;
     }
     if (fetch_url)
         return do_fetch(fetch_url, fetch_out);
+    if (discover)
+        return do_discover();
+    if (cast_target || stop_target) {
+        char host[256], err[160] = "";
+        uint16_t p;
+        split_host(cast_target ? cast_target : stop_target, host, sizeof(host), &p);
+        int rc = cast_target ? cast_open_url(host, p, cast_url, err, sizeof(err))
+                             : cast_stop_app(host, p, err, sizeof(err));
+        if (rc != 0)
+            fprintf(stderr, "error: %s\n", err);
+        return rc ? 1 : 0;
+    }
 
     char ip[16];
     plat_local_ipv4(ip);

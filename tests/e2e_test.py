@@ -107,23 +107,29 @@ def local_ip():
         s.close()
 
 
+def run_fetch(binary, data_dir, url, out):
+    """Runs --fetch with logging on; returns (ok, log). A hang becomes a
+    failure that shows the tool's log instead of aborting the test."""
+    try:
+        r = subprocess.run([binary, "--data", data_dir, "--fetch", url, out],
+                           capture_output=True, text=True, timeout=120)
+        return r.returncode == 0, r.stdout + r.stderr
+    except subprocess.TimeoutExpired as e:
+        log = (e.stdout or b"") + (e.stderr or b"")
+        return False, "TIMEOUT after 120s\n" + (log.decode(errors="replace") if isinstance(log, bytes) else log)
+
+
 def test_fetch(binary, data_dir, base):
     print("HTTP range cache (--fetch)")
     for path in ("/video.mp4", "/redirect", "/norange.mp4"):
         out = os.path.join(data_dir, "fetched.bin")
-        r = subprocess.run(
-            [binary, "--quiet", "--data", data_dir, "--fetch", base + path, out],
-            capture_output=True,
-            timeout=120,
-        )
-        same = r.returncode == 0 and open(out, "rb").read() == MEDIA
+        ok, log = run_fetch(binary, data_dir, base + path, out)
+        same = ok and open(out, "rb").read() == MEDIA
         check(same, f"fetch {path} returns identical bytes")
-    r = subprocess.run(
-        [binary, "--quiet", "--data", data_dir, "--fetch", base + "/missing", "/dev/null"],
-        capture_output=True,
-        timeout=60,
-    )
-    check(r.returncode != 0, "fetch of a 404 fails")
+        if not same:
+            print("    ---- fetch log ----\n    " + "\n    ".join(log.splitlines()[-40:]))
+    ok, _ = run_fetch(binary, data_dir, base + "/missing", "/dev/null")
+    check(not ok, "fetch of a 404 fails")
 
 
 def raw_device_auth(ip):

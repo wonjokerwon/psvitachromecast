@@ -16,11 +16,13 @@
 
 static FILE *g_log;
 
-void vita_platform_init(void)
+void vita_platform_init(const char *log_name)
 {
+    char path[128];
     sceIoMkdir("ux0:data", 0777);
     sceIoMkdir(DATA_DIR, 0777);
-    g_log = fopen(DATA_DIR "/log.txt", "w");
+    snprintf(path, sizeof(path), DATA_DIR "/%s", log_name);
+    g_log = fopen(path, "w");
 }
 
 void vita_platform_shutdown(void)

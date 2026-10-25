@@ -21,7 +21,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: vitacast-vpk
-          path: build-vita/vitacast.vpk
+          path: |
+            build-vita/vitacast.vpk
+            build-vita/vitacast_mirror.vpk
+            build-vita/vitacast_mirror.skprx
 
   host:
     name: Protocol tests (${{ matrix.sanitizer }})
@@ -43,7 +46,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libmbedtls-dev
-          pip install pychromecast catt cryptography
+          pip install pychromecast catt cryptography playwright pillow
+          python -m playwright install --with-deps chromium
       - name: Allow TSan's memory layout
         if: matrix.sanitizer == 'tsan'
         # Ubuntu 24.04's default ASLR entropy breaks ThreadSanitizer.

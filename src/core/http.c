@@ -441,6 +441,8 @@ static int64_t fetch_block(http_source *hs, http_conn *c, int64_t blk, uint8_t *
         body_reader b;
         if (conn_open(c, &hs->url) != 0 || send_request(c, &hs->url, start, end) != 0 ||
             read_response_head(c, &r) != 0) {
+            if (!hs->aborted)
+                LOGI("HTTP: no response for bytes %lld- (attempt %d)", (long long)start, attempt + 1);
             conn_close(c);
             continue;
         }
@@ -470,6 +472,9 @@ static int64_t fetch_block(http_source *hs, http_conn *c, int64_t blk, uint8_t *
             conn_close(c);
         if (got == want)
             return got;
+        if (!hs->aborted)
+            LOGI("HTTP: short read at %lld: %lld of %lld bytes (attempt %d)", (long long)start,
+                 (long long)got, (long long)want, attempt + 1);
         conn_close(c);
     }
     return -1;

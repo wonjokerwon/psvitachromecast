@@ -162,15 +162,16 @@ static void conf_common(mbedtls_ssl_config *conf)
 #endif
 }
 
-int tls_init(const char *data_dir, const char *common_name)
+static int g_base_ready;
+
+/* RNG and the client configuration, shared by both init paths. */
+static int base_init(void)
 {
-    char key_path[512], crt_path[512];
     static const char pers[] = "vitacast";
     int rc;
 
-    if (g_ready)
+    if (g_base_ready)
         return 0;
-
 #if MBEDTLS_VERSION_MAJOR >= 3 && defined(MBEDTLS_PSA_CRYPTO_C)
     psa_crypto_init();
 #endif
@@ -188,6 +189,32 @@ int tls_init(const char *data_dir, const char *common_name)
         LOGI("RNG seeding failed (-0x%04x)", (unsigned)-rc);
         return -1;
     }
+    rc = mbedtls_ssl_config_defaults(&g_cli_conf, MBEDTLS_SSL_IS_CLIENT,
+                                     MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+    if (rc != 0) {
+        LOGI("TLS configuration failed (-0x%04x)", (unsigned)-rc);
+        return -1;
+    }
+    conf_common(&g_cli_conf);
+    mbedtls_ssl_conf_authmode(&g_cli_conf, MBEDTLS_SSL_VERIFY_NONE);
+    g_base_ready = 1;
+    return 0;
+}
+
+int tls_init_client(void)
+{
+    return base_init();
+}
+
+int tls_init(const char *data_dir, const char *common_name)
+{
+    char key_path[512], crt_path[512];
+    int rc;
+
+    if (g_ready)
+        return 0;
+    if (base_init() != 0)
+        return -1;
 
     snprintf(key_path, sizeof(key_path), "%s/device_key.pem", data_dir);
     snprintf(crt_path, sizeof(crt_path), "%s/device_cert.pem", data_dir);
@@ -204,13 +231,6 @@ int tls_init(const char *data_dir, const char *common_name)
         conf_common(&g_srv_conf);
         rc = mbedtls_ssl_conf_own_cert(&g_srv_conf, &g_cert, &g_key);
     }
-    if (rc == 0)
-        rc = mbedtls_ssl_config_defaults(&g_cli_conf, MBEDTLS_SSL_IS_CLIENT,
-                                         MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
-    if (rc == 0) {
-        conf_common(&g_cli_conf);
-        mbedtls_ssl_conf_authmode(&g_cli_conf, MBEDTLS_SSL_VERIFY_NONE);
-    }
     if (rc != 0) {
         LOGI("TLS configuration failed (-0x%04x)", (unsigned)-rc);
         return -1;
@@ -221,7 +241,7 @@ int tls_init(const char *data_dir, const char *common_name)
 
 void tls_shutdown(void)
 {
-    if (!g_ready)
+    if (!g_base_ready)
         return;
     mbedtls_ssl_config_free(&g_srv_conf);
     mbedtls_ssl_config_free(&g_cli_conf);
@@ -230,6 +250,7 @@ void tls_shutdown(void)
     mbedtls_ctr_drbg_free(&g_drbg);
     mbedtls_entropy_free(&g_entropy);
     g_ready = 0;
+    g_base_ready = 0;
 }
 
 const uint8_t *tls_cert_der(size_t *len)

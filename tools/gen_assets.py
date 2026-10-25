@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Generates the LiveArea images in sce_sys/ (requires Pillow).
+"""Generates the LiveArea images in sce_sys/ (VitaCast) and mirror/sce_sys/
+(VitaCast Mirror). Requires Pillow.
 
 The Vita only accepts 8-bit palettised PNGs for these files, so every image
 is quantised before saving.
@@ -10,10 +11,13 @@ import os
 
 from PIL import Image, ImageDraw, ImageFont
 
-ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sce_sys")
+REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 BG_TOP = (24, 36, 64)
 BG_BOTTOM = (10, 12, 18)
-ACCENT = (92, 156, 255)
+RECEIVER = {"dir": "sce_sys", "accent": (92, 156, 255), "title": "VitaCast",
+            "subtitle": "Cast receiver for PS Vita"}
+MIRROR = {"dir": "mirror/sce_sys", "accent": (64, 200, 180), "title": "VitaCast Mirror",
+          "subtitle": "Show your Vita on a TV"}
 WHITE = (240, 242, 245)
 
 
@@ -57,46 +61,49 @@ def font(size):
     return ImageFont.load_default()
 
 
-def save(img, rel):
-    path = os.path.join(ROOT, rel)
+def save(img, app, rel):
+    path = os.path.join(REPO, app["dir"], rel)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     img.convert("RGB").quantize(colors=255, method=Image.Quantize.MEDIANCUT).save(path, optimize=True)
     print("wrote", os.path.relpath(path))
 
 
-def icon():
+def icon(app):
     s = 128
     img = gradient(s, s)
     d = ImageDraw.Draw(img)
-    cast_glyph(d, s / 2, s / 2 + 2, 78, ACCENT)
-    save(img, "icon0.png")
+    cast_glyph(d, s / 2, s / 2 + 2, 78, app["accent"])
+    save(img, app, "icon0.png")
 
 
-def bg():
+def bg(app):
     w, h = 840, 500
+    accent = app["accent"]
     img = gradient(w, h)
     d = ImageDraw.Draw(img)
     # soft rings
     for i in range(6):
         r = 160 + i * 70
-        col = tuple(int(c * 0.35 + b * 0.65) for c, b in zip(ACCENT, BG_BOTTOM))
+        col = tuple(int(c * 0.35 + b * 0.65) for c, b in zip(accent, BG_BOTTOM))
         d.arc([w * 0.78 - r, h * 0.95 - r, w * 0.78 + r, h * 0.95 + r], 180, 300, fill=col, width=2)
-    cast_glyph(d, 210, 240, 180, ACCENT)
-    d.text((360, 190), "VitaCast", font=font(64), fill=WHITE)
-    d.text((364, 272), "Cast receiver for PS Vita", font=font(26), fill=(170, 180, 196))
-    save(img, "livearea/contents/bg.png")
+    cast_glyph(d, 210, 240, 180, accent)
+    title_font = font(64 if len(app["title"]) < 10 else 50)
+    d.text((360, 190), app["title"], font=title_font, fill=WHITE)
+    d.text((364, 272), app["subtitle"], font=font(26), fill=(170, 180, 196))
+    save(img, app, "livearea/contents/bg.png")
 
 
-def startup():
+def startup(app):
     w, h = 280, 158
     img = gradient(w, h)
     d = ImageDraw.Draw(img)
-    cast_glyph(d, 70, h / 2, 70, ACCENT)
+    cast_glyph(d, 70, h / 2, 70, app["accent"])
     d.text((120, h / 2 - 22), "Start", font=font(34), fill=WHITE)
-    save(img, "livearea/contents/startup.png")
+    save(img, app, "livearea/contents/startup.png")
 
 
 if __name__ == "__main__":
-    icon()
-    bg()
-    startup()
+    for app in (RECEIVER, MIRROR):
+        icon(app)
+        bg(app)
+        startup(app)

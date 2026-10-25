@@ -4,7 +4,8 @@
 
 #include <vita2d.h>
 
-void vita_platform_init(void);
+/* log_name: file in the data directory, e.g. "log.txt" */
+void vita_platform_init(const char *log_name);
 void vita_platform_shutdown(void);
 
 /* Latest decoded video frame as a vita2d texture (NULL when there is none).
