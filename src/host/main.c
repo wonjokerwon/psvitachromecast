@@ -1,11 +1,14 @@
 /* vitacast-host: the VitaCast receiver running on a desktop OS with a
  * simulated player. Used to develop and test the Cast protocol without a
  * Vita; `--fetch` exercises the HTTP range source on its own. */
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "../core/cast_sender.h"
 #include "../core/config.h"
@@ -45,6 +48,33 @@ static void usage(const char *argv0)
             argv0);
 }
 
+/* --fetch watchdog: if no progress for 30s, describe where everything is
+ * stuck and exit, so test logs show the cause instead of a bare timeout. */
+static http_source *g_fetch_hs;
+static atomic_llong g_fetch_pos;
+static atomic_int g_fetch_done;
+
+static void *fetch_watchdog(void *arg)
+{
+    (void)arg;
+    long long last = -1;
+    int still = 0;
+    while (!g_fetch_done) {
+        plat_sleep_ms(1000);
+        long long pos = g_fetch_pos;
+        still = pos == last ? still + 1 : 0;
+        last = pos;
+        if (still >= 30) {
+            char state[1024];
+            http_source_debug(g_fetch_hs, state, sizeof(state));
+            fprintf(stderr, "watchdog: no progress for 30s at offset %lld\nwatchdog: %s\n", pos, state);
+            fflush(stderr);
+            _exit(3);
+        }
+    }
+    return NULL;
+}
+
 static int do_fetch(const char *url, const char *out_path)
 {
     char err[160];
@@ -59,6 +89,9 @@ static int do_fetch(const char *url, const char *out_path)
         return 1;
     }
     int64_t size = http_source_size(hs);
+    pthread_t wd;
+    g_fetch_hs = hs;
+    pthread_create(&wd, NULL, fetch_watchdog, NULL);
     /* Odd, varying read sizes plus a few backward jumps, like a demuxer. */
     static uint8_t buf[300000];
     uint64_t pos = 0;
@@ -83,10 +116,14 @@ static int do_fetch(const char *url, const char *out_path)
         }
         fwrite(buf, 1, (size_t)n, f);
         pos += (uint64_t)n;
+        g_fetch_pos = (long long)pos;
         step = step * 3 % 299989 + 17;
     }
     fclose(f);
+    g_fetch_pos = -2; /* closing counts as progress */
     http_source_close(hs);
+    g_fetch_done = 1;
+    pthread_join(wd, NULL);
     if (rc == 0)
         printf("fetched %lld bytes\n", (long long)size);
     return rc;

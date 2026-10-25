@@ -93,7 +93,11 @@ typedef struct http_conn {
     uint8_t buf[16384];
     size_t pos, len;
     atomic_int *abort_flag;
+    atomic_int phase; /* conn_phase, for http_source_debug() */
 } http_conn;
+
+enum conn_phase { PH_IDLE, PH_CONNECT, PH_SEND, PH_HEAD, PH_BODY, PH_SKIP };
+static const char *const g_phase_names[] = { "idle", "connect", "send", "head", "body", "skip" };
 
 typedef struct http_resp {
     int status;
@@ -425,6 +429,10 @@ struct http_source {
     int64_t pf_from, pf_to;
     int closing;
     atomic_int aborted;
+    /* where each thread is, for http_source_debug() */
+    atomic_int reader_waiting;
+    atomic_int prefetch_waiting;
+    atomic_llong prefetch_block;
 };
 
 /* Fetches block `blk` into dst using connection c. Returns bytes or -1. */
@@ -439,8 +447,15 @@ static int64_t fetch_block(http_source *hs, http_conn *c, int64_t blk, uint8_t *
     for (int attempt = 0; attempt < 3 && !hs->aborted; attempt++) {
         http_resp r;
         body_reader b;
-        if (conn_open(c, &hs->url) != 0 || send_request(c, &hs->url, start, end) != 0 ||
-            read_response_head(c, &r) != 0) {
+        int ok;
+        c->phase = PH_CONNECT;
+        ok = conn_open(c, &hs->url) == 0;
+        c->phase = PH_SEND;
+        ok = ok && send_request(c, &hs->url, start, end) == 0;
+        c->phase = PH_HEAD;
+        ok = ok && read_response_head(c, &r) == 0;
+        if (!ok) {
+            c->phase = PH_IDLE;
             if (!hs->aborted)
                 LOGI("HTTP: no response for bytes %lld- (attempt %d)", (long long)start, attempt + 1);
             conn_close(c);
@@ -449,6 +464,7 @@ static int64_t fetch_block(http_source *hs, http_conn *c, int64_t blk, uint8_t *
         body_init(&b, c, &r);
         int64_t got = -1;
         int reusable = r.keep_alive;
+        c->phase = PH_BODY;
         if (r.status == 206 && r.range_start == start) {
             got = body_read_full(&b, dst, (size_t)want);
             if (got == want && !b.done) {
@@ -461,6 +477,7 @@ static int64_t fetch_block(http_source *hs, http_conn *c, int64_t blk, uint8_t *
         } else if (r.status == 200) {
             /* Server ignores ranges: skip to the block from the start. */
             hs->ranges_ok = 0;
+            c->phase = PH_SKIP;
             if (body_skip(&b, start) == 0)
                 got = body_read_full(&b, dst, (size_t)want);
             reusable = 0;
@@ -470,6 +487,7 @@ static int64_t fetch_block(http_source *hs, http_conn *c, int64_t blk, uint8_t *
         }
         if (!reusable || !b.done)
             conn_close(c);
+        c->phase = PH_IDLE;
         if (got == want)
             return got;
         if (!hs->aborted)
@@ -530,7 +548,9 @@ static void *prefetch_main(void *arg)
             }
         }
         if (blk < 0) {
+            hs->prefetch_waiting = 1;
             pthread_cond_wait(&hs->cond, &hs->lock);
+            hs->prefetch_waiting = 0;
             continue;
         }
         hs_slot *s = evict_slot(hs, hs->pf_from - 1, hs->pf_to);
@@ -540,6 +560,7 @@ static void *prefetch_main(void *arg)
         }
         s->block = blk;
         s->state = SLOT_LOADING;
+        hs->prefetch_block = blk;
         pthread_mutex_unlock(&hs->lock);
         int64_t n = fetch_block(hs, &hs->prefetcher, blk, s->data);
         pthread_mutex_lock(&hs->lock);
@@ -694,7 +715,9 @@ int http_source_read(http_source *hs, uint8_t *buf, uint64_t pos, uint32_t len)
         uint32_t off = (uint32_t)(pos % HS_BLOCK);
         hs_slot *s = find_slot(hs, blk);
         if (s && s->state == SLOT_LOADING) {
+            hs->reader_waiting = 1;
             pthread_cond_wait(&hs->cond, &hs->lock);
+            hs->reader_waiting = 0;
             continue;
         }
         if (!s) {
@@ -762,4 +785,26 @@ void http_source_close(http_source *hs)
     if (hs->prefetch_started)
         pthread_join(hs->prefetch_thread, NULL);
     hs_free(hs);
+}
+
+void http_source_debug(http_source *hs, char *out, size_t cap)
+{
+    static const char states[] = { '.', 'L', 'R' };
+    char slots[HS_SLOTS * 12 + 1];
+    size_t o = 0;
+    /* Read without the lock: this runs when something may be holding it. */
+    for (int i = 0; i < HS_SLOTS && o + 12 < sizeof(slots); i++) {
+        if (hs->slots[i].state == SLOT_EMPTY)
+            continue;
+        o += (size_t)snprintf(slots + o, sizeof(slots) - o, "%lld%c ", (long long)hs->slots[i].block,
+                              states[hs->slots[i].state]);
+    }
+    slots[o] = '\0';
+    snprintf(out, cap,
+             "size=%lld ranges=%d aborted=%d window=[%lld,%lld] reader: phase=%s waiting=%d "
+             "prefetcher: phase=%s waiting=%d block=%lld started=%d slots: %s",
+             (long long)hs->size, hs->ranges_ok, (int)hs->aborted, (long long)hs->pf_from,
+             (long long)hs->pf_to, g_phase_names[hs->reader.phase], (int)hs->reader_waiting,
+             g_phase_names[hs->prefetcher.phase], (int)hs->prefetch_waiting,
+             (long long)hs->prefetch_block, hs->prefetch_started, slots);
 }

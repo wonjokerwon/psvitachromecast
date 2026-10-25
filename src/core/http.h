@@ -28,5 +28,7 @@ int http_source_read(http_source *hs, uint8_t *buf, uint64_t pos, uint32_t len);
 /* Makes current and future reads fail quickly. Thread safe. */
 void http_source_abort(http_source *hs);
 void http_source_close(http_source *hs);
+/* One-line description of the cache and its threads, for diagnosing stalls. */
+void http_source_debug(http_source *hs, char *out, size_t cap);
 
 #endif
