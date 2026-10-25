@@ -107,19 +107,55 @@ def local_ip():
         s.close()
 
 
+def describe_hang(pid):
+    """Thread states and, where gdb and sudo are available (CI runners),
+    every thread's stack. Used when --fetch stops responding."""
+    lines = []
+    task_dir = f"/proc/{pid}/task"
+    try:
+        for tid in sorted(os.listdir(task_dir), key=int):
+            def read(name):
+                try:
+                    with open(f"{task_dir}/{tid}/{name}") as f:
+                        return f.read().strip()
+                except OSError:
+                    return "?"
+            stat = read("stat")
+            state = stat.rsplit(")", 1)[-1].split()[0] if ")" in stat else "?"
+            lines.append(f"thread {tid} {read('comm')} state={state} wchan={read('wchan')}")
+    except OSError as e:
+        lines.append(f"cannot read {task_dir}: {e}")
+    gdb = shutil.which("gdb")
+    if gdb:
+        try:
+            r = subprocess.run(["sudo", "-n", gdb, "-batch", "-p", str(pid),
+                                "-ex", "thread apply all bt 25"],
+                               capture_output=True, text=True, timeout=90)
+            lines += [l for l in (r.stdout + r.stderr).splitlines()
+                      if l.startswith(("Thread", "#")) or "error" in l.lower()]
+        except (subprocess.TimeoutExpired, OSError) as e:
+            lines.append(f"gdb failed: {e}")
+    return "\n".join(lines)
+
+
 def run_fetch(binary, data_dir, url, out):
     """Runs --fetch with logging on; returns (ok, log). A hang becomes a
-    failure that shows the tool's log instead of aborting the test."""
-    try:
-        r = subprocess.run([binary, "--data", data_dir, "--fetch", url, out],
-                           capture_output=True, text=True, timeout=120)
-        return r.returncode == 0, r.stdout + r.stderr
-    except subprocess.TimeoutExpired as e:
-        log = (e.stdout or b"") + (e.stderr or b"")
-        if isinstance(log, bytes):
-            log = log.decode(errors="replace")
-        complete = os.path.exists(out) and open(out, "rb").read() == MEDIA
-        return False, f"TIMEOUT after 120s (output file complete: {complete})\n" + log
+    failure that shows the tool's log and where its threads are stuck."""
+    with tempfile.TemporaryFile("w+") as log:
+        proc = subprocess.Popen([binary, "--data", data_dir, "--fetch", url, out],
+                                stdout=log, stderr=subprocess.STDOUT, text=True)
+        try:
+            proc.wait(timeout=90)
+            log.seek(0)
+            return proc.returncode == 0, log.read()
+        except subprocess.TimeoutExpired:
+            where = describe_hang(proc.pid)
+            proc.kill()
+            proc.wait()
+            log.seek(0)
+            complete = os.path.exists(out) and open(out, "rb").read() == MEDIA
+            return False, (f"TIMEOUT after 90s (output file complete: {complete})\n"
+                           + log.read() + "\n---- threads ----\n" + where)
 
 
 def test_fetch(binary, data_dir, base):
@@ -130,7 +166,7 @@ def test_fetch(binary, data_dir, base):
         same = ok and open(out, "rb").read() == MEDIA
         check(same, f"fetch {path} returns identical bytes")
         if not same:
-            print("    ---- fetch log ----\n    " + "\n    ".join(log.splitlines()[-40:]))
+            print("    ---- fetch log ----\n    " + "\n    ".join(log.splitlines()[-200:]))
     ok, _ = run_fetch(binary, data_dir, base + "/missing", "/dev/null")
     check(not ok, "fetch of a 404 fails")
 

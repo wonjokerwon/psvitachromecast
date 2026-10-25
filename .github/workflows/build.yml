@@ -45,7 +45,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libmbedtls-dev
+          sudo apt-get install -y libmbedtls-dev gdb
           pip install pychromecast catt cryptography playwright pillow
           python -m playwright install --with-deps chromium
       - name: Allow TSan's memory layout
