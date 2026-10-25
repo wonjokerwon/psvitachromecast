@@ -125,6 +125,18 @@ def describe_hang(pid):
             lines.append(f"thread {tid} {read('comm')} state={state} wchan={read('wchan')}")
     except OSError as e:
         lines.append(f"cannot read {task_dir}: {e}")
+    # TCP state of every connection: queues, windows and running timers.
+    if shutil.which("ss"):
+        r = subprocess.run(["ss", "-tinpo"], capture_output=True, text=True)
+        lines.append("---- sockets (ss -tinpo) ----")
+        lines += r.stdout.splitlines()
+    # Where the test's own HTTP server threads are.
+    import faulthandler
+    with tempfile.TemporaryFile("w+") as tb:
+        faulthandler.dump_traceback(file=tb, all_threads=True)
+        tb.seek(0)
+        lines.append("---- test process (HTTP server) threads ----")
+        lines += tb.read().splitlines()
     gdb = shutil.which("gdb")
     if gdb:
         try:

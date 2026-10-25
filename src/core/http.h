@@ -30,5 +30,8 @@ void http_source_abort(http_source *hs);
 void http_source_close(http_source *hs);
 /* One-line description of the cache and its threads, for diagnosing stalls. */
 void http_source_debug(http_source *hs, char *out, size_t cap);
+/* Like http_source_debug, but only the fields that are safe to read while
+ * the source is in use (no data races), for periodic progress logs. */
+void http_source_progress(http_source *hs, char *out, size_t cap);
 
 #endif

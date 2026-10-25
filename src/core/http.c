@@ -97,6 +97,7 @@ typedef struct http_conn {
     size_t pos, len;
     atomic_int *abort_flag;
     atomic_int phase; /* conn_phase, for http_source_debug() */
+    atomic_llong rx;  /* bytes received, for http_source_debug() */
     int timeout_ms;   /* idle limit for connect and reads; 0 = HTTP_TIMEOUT_MS */
 } http_conn;
 
@@ -162,6 +163,7 @@ static int conn_fill(http_conn *c)
         if (n <= 0)
             return n == 0 ? 0 : -1;
         c->len = (size_t)n;
+        c->rx += n;
         return 1;
     }
 }
@@ -792,6 +794,14 @@ void http_source_close(http_source *hs)
     hs_free(hs);
 }
 
+void http_source_progress(http_source *hs, char *out, size_t cap)
+{
+    snprintf(out, cap, "reader: phase=%s rx=%lld waiting=%d prefetcher: phase=%s rx=%lld block=%lld",
+             g_phase_names[hs->reader.phase], (long long)hs->reader.rx, (int)hs->reader_waiting,
+             g_phase_names[hs->prefetcher.phase], (long long)hs->prefetcher.rx,
+             (long long)hs->prefetch_block);
+}
+
 void http_source_debug(http_source *hs, char *out, size_t cap)
 {
     static const char states[] = { '.', 'L', 'R' };
@@ -806,10 +816,11 @@ void http_source_debug(http_source *hs, char *out, size_t cap)
     }
     slots[o] = '\0';
     snprintf(out, cap,
-             "size=%lld ranges=%d aborted=%d window=[%lld,%lld] reader: phase=%s waiting=%d "
-             "prefetcher: phase=%s waiting=%d block=%lld started=%d slots: %s",
+             "size=%lld ranges=%d aborted=%d window=[%lld,%lld] reader: phase=%s rx=%lld waiting=%d "
+             "prefetcher: phase=%s rx=%lld waiting=%d block=%lld started=%d slots: %s",
              (long long)hs->size, hs->ranges_ok, (int)hs->aborted, (long long)hs->pf_from,
-             (long long)hs->pf_to, g_phase_names[hs->reader.phase], (int)hs->reader_waiting,
-             g_phase_names[hs->prefetcher.phase], (int)hs->prefetch_waiting,
+             (long long)hs->pf_to, g_phase_names[hs->reader.phase], (long long)hs->reader.rx,
+             (int)hs->reader_waiting, g_phase_names[hs->prefetcher.phase],
+             (long long)hs->prefetcher.rx, (int)hs->prefetch_waiting,
              (long long)hs->prefetch_block, hs->prefetch_started, slots);
 }

@@ -48,8 +48,9 @@ static void usage(const char *argv0)
             argv0);
 }
 
-/* --fetch watchdog: if no progress for 30s, describe where everything is
- * stuck and exit, so test logs show the cause instead of a bare timeout. */
+/* --fetch watchdog: logs progress every 5s, and if there is none for 30s
+ * describes where everything is stuck and exits, so test logs show the
+ * cause instead of a bare timeout. */
 static http_source *g_fetch_hs;
 static atomic_llong g_fetch_pos;
 static atomic_int g_fetch_done;
@@ -59,11 +60,17 @@ static void *fetch_watchdog(void *arg)
     (void)arg;
     long long last = -1;
     int still = 0;
-    while (!g_fetch_done) {
+    for (int sec = 1; !g_fetch_done; sec++) {
         plat_sleep_ms(1000);
         long long pos = g_fetch_pos;
         still = pos == last ? still + 1 : 0;
         last = pos;
+        if (sec % 5 == 0) {
+            char state[256];
+            http_source_progress(g_fetch_hs, state, sizeof(state));
+            fprintf(stderr, "watchdog: %ds offset %lld: %s\n", sec, pos, state);
+            fflush(stderr);
+        }
         if (still >= 30) {
             char state[1024];
             http_source_debug(g_fetch_hs, state, sizeof(state));
