@@ -366,8 +366,12 @@ def main():
         check(wait_for(lambda: cast.status.volume_muted is True, 5), "mute")
         cast.set_volume_muted(False)
 
-        mc.update_status()
-        check(wait_for(lambda: mc.status.current_time > 7.5, 5), "playback time advances")
+        # Receivers report time only when asked, so keep asking: one early
+        # reply can still show the time from just before PLAY.
+        def time_advanced():
+            mc.update_status()
+            return mc.status.current_time > 7.5
+        check(wait_for(time_advanced, 5, 0.25), "playback time advances")
 
         mc.seek(SIM_DURATION - 1.0)
         check(
